@@ -6,6 +6,7 @@ description = "A crate for consuming the runc binary in your Rust applications."
 repository = "https://github.com/fsyncd/rust-runc"
 license = "Apache-2.0"
 edition = "2018"
+exclude = ["test_fixture"]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
