@@ -6,7 +6,7 @@ Based on the reference go-runc implementation, rust-runc has a compatible high l
 
 ## Usage
 
-Please refer to the crate documentation
+Please refer to the crate [documentation](https://docs.rs/rust-runc/0.1.0/rust_runc/).
 
 ## Rust-runc Limitations
 
