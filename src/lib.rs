@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 fsyncd, Berlin, Germany.
+ * Copyright 2020 fsyncd, Berlin, Germany.
  * Additional material, copyright of the containerd authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,29 +15,32 @@
  * limitations under the License.
  */
 
-//! A crate for consuming the runc binary in your Rust applications.
-
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, Write};
-use std::iter::FromIterator;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::Duration;
-use std::{env, fs, io};
-
-use chrono::{DateTime, Utc};
-use futures::future::{err, ok};
-use futures::{try_ready, Async, Future, Stream};
-use log::{error, warn};
-use serde::{Deserialize, Serialize};
-use tokio::io::AsyncRead;
-use tokio::prelude::FutureExt;
-use tokio_process::{Child, ChildStderr, ChildStdout, CommandExt};
-use uuid::Uuid;
-
 use crate::events::{Event, Stats};
 use crate::specs::{LinuxResources, Process};
+use chrono::{DateTime, Utc};
+use futures::ready;
+use futures::task::{Context, Poll};
+use log::warn;
+use serde::{Deserialize, Serialize};
+use snafu::{ensure, OptionExt, ResultExt, Snafu};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::iter::FromIterator;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::string::FromUtf8Error;
+use std::time::Duration;
+use std::{env, fs, io};
+use tokio::io::AsyncBufReadExt;
+use tokio::io::BufReader;
+use tokio::macros::support::Pin;
+use tokio::process::Child;
+use tokio::process::Command;
+use tokio::stream::Stream;
+use tokio::stream::StreamExt;
+use tokio::time::timeout;
+use uuid::Uuid;
 
 /// Container PTY terminal
 pub mod console;
@@ -50,50 +53,74 @@ pub mod specs;
 pub type TopResults = Vec<HashMap<String, String>>;
 
 /// Runc client error
-#[derive(Debug)]
+#[derive(Debug, Snafu)]
 pub enum Error {
-    Unknown,
-    CommandTimeout,
-    UnicodeError,
-    IoError(io::Error),
-    JsonError(serde_json::error::Error),
-}
+    #[snafu(display("Unable to locate the runc binary"))]
+    RuncNotFoundError {},
 
-impl From<io::Error> for Error {
-    fn from(e: io::Error) -> Self {
-        Error::IoError(e)
-    }
-}
+    #[snafu(display("Invalid path: {}", source))]
+    InvalidPathError { source: io::Error },
 
-impl From<std::convert::Infallible> for Error {
-    fn from(_: std::convert::Infallible) -> Self {
-        Error::UnicodeError
-    }
-}
+    #[snafu(display("Unable to spawn process: {}", source))]
+    ProcessSpawnError { source: io::Error },
 
-impl From<std::string::FromUtf8Error> for Error {
-    fn from(_: std::string::FromUtf8Error) -> Self {
-        Error::UnicodeError
-    }
-}
+    #[snafu(display("Runc command error: {}", source))]
+    RuncCommandError { source: io::Error },
 
-impl From<serde_json::error::Error> for Error {
-    fn from(e: serde_json::error::Error) -> Self {
-        Error::JsonError(e)
-    }
-}
+    #[snafu(display("Runc command timed out: {}", source))]
+    RuncCommandTimeoutError { source: tokio::time::Elapsed },
 
-impl From<tokio::timer::timeout::Error<Error>> for Error {
-    fn from(e: tokio::timer::timeout::Error<Error>) -> Self {
-        if e.is_inner() {
-            match e.into_inner() {
-                Some(inner_error) => inner_error,
-                None => Error::Unknown,
-            }
-        } else {
-            Error::CommandTimeout
-        }
-    }
+    #[snafu(display("Unicode conversion error: {}", source))]
+    UnicodeConversionError { source: FromUtf8Error },
+
+    #[snafu(display(
+        "Runc returned with an error, stdout: \"{}\", stderr: \"{}\"",
+        stdout,
+        stderr
+    ))]
+    RuncCommandFailedError { stdout: String, stderr: String },
+
+    #[snafu(display("JSON deserialization error: {}", source))]
+    JsonDeserializationError { source: serde_json::error::Error },
+
+    #[snafu(display("Missing container statistics"))]
+    MissingContainerStatsError {},
+
+    #[snafu(display("Top command is missing a pid header"))]
+    TopMissingPidHeaderError {},
+
+    #[snafu(display("Top command returned an empty response"))]
+    TopShortResponseError {},
+
+    #[snafu(display("Failed to find valid path for spec file"))]
+    SpecFilePathError {},
+
+    #[snafu(display("Failed to create spec file: {}", source))]
+    SpecFileCreationError { source: io::Error },
+
+    #[snafu(display("Failed to cleanup spec file: {}", source))]
+    SpecFileCleanupError { source: io::Error },
+
+    #[snafu(display("Unable to parse runc version"))]
+    RuncInvalidVersionError {},
+
+    #[snafu(display("Unable to parse runc spec version"))]
+    RuncInvalidSpecVersionError {},
+
+    #[snafu(display("Unable to bind to unix socket: {}", source))]
+    UnixSocketOpenError { source: io::Error },
+
+    #[snafu(display("Unix socket unexpectedly closed"))]
+    UnixSocketUnexpectedCloseError {},
+
+    #[snafu(display("Unix socket connection error: {}", source))]
+    UnixSocketConnectError { source: io::Error },
+
+    #[snafu(display("Unix socket connection error"))]
+    UnixSocketReceiveMessageError {},
+
+    #[snafu(display("Unable to extract test files: {}", source))]
+    BundleExtractError { source: io::Error },
 }
 
 /// Runc container
@@ -152,8 +179,6 @@ pub struct RuncConfiguration {
     pub systemd_cgroup: bool,
     /// Run in rootless mode
     pub rootless: Option<bool>,
-    /// Delete the runc binary and root directory after use (TEST USE ONLY)
-    pub should_cleanup: bool,
 }
 
 /// Runc client
@@ -166,7 +191,6 @@ pub struct Runc {
     log_format: Option<RuncLogFormat>,
     systemd_cgroup: bool,
     rootless: Option<bool>,
-    should_cleanup: bool,
 }
 
 trait Args {
@@ -176,13 +200,14 @@ trait Args {
 impl Runc {
     /// Create a new runc client from the supplied configuration
     pub fn new(config: RuncConfiguration) -> Result<Self, Error> {
-        let command = config.command.or_else(Self::runc_binary).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "unable to locate runc binary")
-        })?;
-        let timeout = match config.timeout.or(Some(Duration::from_millis(5000))) {
-            Some(timeout) => timeout,
-            None => return Err(Error::Unknown),
-        };
+        let command = config
+            .command
+            .or_else(Self::runc_binary)
+            .context(RuncNotFoundError {})?;
+        let timeout = config
+            .timeout
+            .or(Some(Duration::from_millis(5000)))
+            .unwrap();
         Ok(Self {
             command,
             timeout,
@@ -192,271 +217,191 @@ impl Runc {
             log_format: config.log_format,
             systemd_cgroup: config.systemd_cgroup,
             rootless: config.rootless,
-            should_cleanup: config.should_cleanup,
         })
     }
 
     /// Create a new container
-    pub fn create(
-        self,
+    pub async fn create(
+        &self,
         id: &str,
         bundle: &PathBuf,
         opts: Option<&CreateOpts>,
-    ) -> Box<dyn Future<Item = Self, Error = Error> + Send> {
+    ) -> Result<(), Error> {
         let mut args = vec![String::from("create")];
-        if let Err(e) = Self::append_opts(&mut args, opts.map(|opts| opts as &dyn Args)) {
-            return Box::new(err(e));
-        }
-        let bundle: String = match bundle.canonicalize() {
-            Ok(path) => match path.to_string_lossy().parse() {
-                Ok(path) => path,
-                Err(e) => {
-                    return Box::new(err(e.into()));
-                }
-            },
-            Err(e) => {
-                return Box::new(err(e.into()));
-            }
-        };
+        Self::append_opts(&mut args, opts.map(|opts| opts as &dyn Args))?;
+        let bundle: String = bundle
+            .canonicalize()
+            .context(InvalidPathError {})?
+            .to_string_lossy()
+            .parse()
+            .unwrap();
         args.push(String::from("--bundle"));
         args.push(bundle);
         args.push(String::from(id));
-        Box::new(self.command(&args, true).map(|(runc, _)| runc))
+        self.command(&args, true).await.map(|_| ())
     }
 
     /// Delete a container
-    pub fn delete(
-        self,
-        id: &str,
-        opts: Option<&DeleteOpts>,
-    ) -> Box<dyn Future<Item = Self, Error = Error> + Send> {
+    pub async fn delete(&self, id: &str, opts: Option<&DeleteOpts>) -> Result<(), Error> {
         let mut args = vec![String::from("delete")];
-        if let Err(e) = Self::append_opts(&mut args, opts.map(|opts| opts as &dyn Args)) {
-            return Box::new(err(e));
-        }
+        Self::append_opts(&mut args, opts.map(|opts| opts as &dyn Args))?;
         args.push(String::from(id));
-        Box::new(self.command(&args, true).map(|(runc, _)| runc))
+        self.command(&args, true).await.map(|_| ())
     }
 
     /// Return an event stream of container notifications
-    pub fn events(
-        self,
-        id: &str,
-        interval: &Duration,
-    ) -> Box<dyn Future<Item = (Self, EventStream), Error = Error> + Send> {
+    pub async fn events(&self, id: &str, interval: &Duration) -> Result<EventStream, Error> {
         let args = vec![
             String::from("events"),
             format!("--interval={}s", interval.as_secs()),
             String::from(id),
         ];
-        Box::new(
-            self.command_with_streaming_output(&args, false)
-                .and_then(|(runc, console_stream)| Ok((runc, EventStream::new(console_stream)))),
-        )
+        let console_stream = self.command_with_streaming_output(&args, false).await?;
+        Ok(EventStream::new(console_stream))
     }
 
     /// Execute an additional process inside the container
-    pub fn exec(
-        self,
+    pub async fn exec(
+        &self,
         id: &str,
         spec: &Process,
         opts: Option<&ExecOpts>,
-    ) -> Box<dyn Future<Item = Self, Error = Error> + Send> {
-        let temp_file = env::var_os("XDG_RUNTIME_DIR").and_then(|temp_dir| {
-            match temp_dir.to_string_lossy().parse() as Result<String, _> {
-                Ok(temp_dir) => Some(PathBuf::from(format!(
-                    "{}/runc-process-{}",
-                    temp_dir,
-                    Uuid::new_v4()
-                ))),
-                Err(_) => None,
-            }
-        });
-
-        let temp_file = match temp_file {
-            Some(p) => p,
-            None => {
-                return Box::new(err(Error::IoError(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "unable to create temporary spec file",
-                ))))
-            }
-        };
+    ) -> Result<(), Error> {
+        let temp_file = env::var_os("XDG_RUNTIME_DIR")
+            .and_then(
+                |temp_dir| match temp_dir.to_string_lossy().parse() as Result<String, _> {
+                    Ok(temp_dir) => Some(PathBuf::from(format!(
+                        "{}/runc-process-{}",
+                        temp_dir,
+                        Uuid::new_v4()
+                    ))),
+                    Err(_) => None,
+                },
+            )
+            .context(SpecFilePathError {})?;
 
         {
-            let spec_json = match serde_json::to_string(spec) {
-                Ok(spec_json) => spec_json,
-                Err(e) => return Box::new(err(e.into())),
-            };
-
-            let mut f = match File::create(temp_file.clone()) {
-                Ok(f) => f,
-                Err(e) => return Box::new(err(e.into())),
-            };
-
-            if let Err(e) = f.write(spec_json.as_bytes()) {
-                return Box::new(err(e.into()));
-            }
-            if let Err(e) = f.flush() {
-                return Box::new(err(e.into()));
-            }
+            let spec_json = serde_json::to_string(spec).context(JsonDeserializationError {})?;
+            let mut f = File::create(temp_file.clone()).context(SpecFileCreationError {})?;
+            f.write(spec_json.as_bytes())
+                .context(SpecFileCreationError {})?;
+            f.flush().context(SpecFileCreationError {})?;
         }
 
-        let temp_file = match temp_file.to_string_lossy().parse() as Result<String, _> {
-            Ok(p) => p,
-            Err(_) => return Box::new(err(Error::UnicodeError)),
-        };
-
+        let temp_file: String = temp_file.to_string_lossy().parse().unwrap();
         let mut args = vec![
             String::from("exec"),
             String::from("--process"),
             temp_file.clone(),
         ];
-        if let Err(e) = Self::append_opts(&mut args, opts.map(|opts| opts as &dyn Args)) {
-            return Box::new(err(e));
-        }
+        Self::append_opts(&mut args, opts.map(|opts| opts as &dyn Args))?;
         args.push(String::from(id));
 
-        Box::new(
-            Box::new(self.command(&args, true).map(|(runc, _)| runc)).then(move |res| {
-                if let Err(e) = fs::remove_file(temp_file) {
-                    return Err(e.into());
-                }
-                res
-            }),
-        )
+        let res = self.command(&args, true).await.map(|_| ());
+        fs::remove_file(temp_file).context(SpecFileCleanupError {})?;
+        res
     }
 
     /// Send the specified signal to processes inside the container
-    pub fn kill(
-        self,
-        id: &str,
-        sig: i32,
-        opts: Option<&KillOpts>,
-    ) -> Box<dyn Future<Item = Self, Error = Error> + Send> {
+    pub async fn kill(&self, id: &str, sig: i32, opts: Option<&KillOpts>) -> Result<(), Error> {
         let mut args = vec![String::from("kill")];
-        if let Err(e) = Self::append_opts(&mut args, opts.map(|opts| opts as &dyn Args)) {
-            return Box::new(err(e));
-        }
+        Self::append_opts(&mut args, opts.map(|opts| opts as &dyn Args))?;
         args.push(String::from(id));
         args.push(format!("{}", sig));
-        Box::new(self.command(&args, true).map(|(runc, _)| runc))
+        self.command(&args, true).await.map(|_| ())
     }
 
     /// List all containers associated with this runc instance
-    pub fn list(self) -> Box<dyn Future<Item = (Self, Vec<Container>), Error = Error> + Send> {
+    pub async fn list(&self) -> Result<Vec<Container>, Error> {
         let args = vec![String::from("list"), String::from("--format=json")];
-        Box::new(self.command(&args, false).and_then(|(runc, output)| {
-            let output = output.trim();
-            // Ugly hack to work around golang
-            if output == "null" {
-                return Ok((runc, Vec::new()));
-            }
-            Ok((runc, serde_json::from_str(&output)?))
-        }))
+        let output = self.command(&args, false).await?;
+        let output = output.trim();
+        // Ugly hack to work around golang
+        Ok(if output == "null" {
+            Vec::new()
+        } else {
+            serde_json::from_str(&output).context(JsonDeserializationError {})?
+        })
     }
 
     /// Pause a container
-    pub fn pause(self, id: &str) -> Box<dyn Future<Item = Self, Error = Error> + Send> {
+    pub async fn pause(&self, id: &str) -> Result<(), Error> {
         let args = vec![String::from("pause"), String::from(id)];
-        Box::new(self.command(&args, true).map(|(runc, _)| runc))
+        self.command(&args, true).await.map(|_| ())
     }
 
     /// List processes inside a container, returning their pids
-    pub fn ps(self, id: &str) -> Box<dyn Future<Item = (Self, Vec<usize>), Error = Error> + Send> {
+    pub async fn ps(&self, id: &str) -> Result<Vec<usize>, Error> {
         let args = vec![
             String::from("ps"),
             String::from("--format=json"),
             String::from(id),
         ];
-        Box::new(self.command(&args, false).and_then(|(runc, output)| {
-            let output = output.trim();
-            // Ugly hack to work around golang
-            if output == "null" {
-                return Ok((runc, Vec::new()));
-            }
-            Ok((runc, serde_json::from_str(&output)?))
-        }))
+        let output = self.command(&args, false).await?;
+        let output = output.trim();
+        // Ugly hack to work around golang
+        Ok(if output == "null" {
+            Vec::new()
+        } else {
+            serde_json::from_str(&output).context(JsonDeserializationError {})?
+        })
     }
 
     /// Resume a container
-    pub fn resume(self, id: &str) -> Box<dyn Future<Item = Self, Error = Error> + Send> {
+    pub async fn resume(&self, id: &str) -> Result<(), Error> {
         let args = vec![String::from("resume"), String::from(id)];
-        Box::new(self.command(&args, true).map(|(runc, _)| runc))
+        self.command(&args, true).await.map(|_| ())
     }
 
     /// Run the create, start, delete lifecycle of the container and return its exit status
-    pub fn run(
-        self,
+    pub async fn run(
+        &self,
         id: &str,
         bundle: &PathBuf,
         opts: Option<&CreateOpts>,
-    ) -> Box<dyn Future<Item = Self, Error = Error> + Send> {
+    ) -> Result<(), Error> {
         let mut args = vec![String::from("run")];
-        if let Err(e) = Self::append_opts(&mut args, opts.map(|opts| opts as &dyn Args)) {
-            return Box::new(err(e));
-        }
-        let bundle: String = match bundle.canonicalize() {
-            Ok(path) => match path.to_string_lossy().parse() {
-                Ok(path) => path,
-                Err(e) => {
-                    return Box::new(err(e.into()));
-                }
-            },
-            Err(e) => {
-                return Box::new(err(e.into()));
-            }
-        };
+        Self::append_opts(&mut args, opts.map(|opts| opts as &dyn Args))?;
+        let bundle: String = bundle
+            .canonicalize()
+            .context(InvalidPathError {})?
+            .to_string_lossy()
+            .parse()
+            .unwrap();
         args.push(String::from("--bundle"));
         args.push(bundle);
         args.push(String::from(id));
-        Box::new(self.command(&args, true).map(|(runc, _)| runc))
+        self.command(&args, true).await.map(|_| ())
     }
 
     /// Start an already created container
-    pub fn start(self, id: &str) -> Box<dyn Future<Item = Self, Error = Error> + Send> {
+    pub async fn start(&self, id: &str) -> Result<(), Error> {
         let args = vec![String::from("start"), String::from(id)];
-        Box::new(self.command(&args, true).map(|(runc, _)| runc))
+        self.command(&args, true).await.map(|_| ())
     }
 
     /// Return the state of a container
-    pub fn state(
-        self,
-        id: &str,
-    ) -> Box<dyn Future<Item = (Self, Container), Error = Error> + Send> {
+    pub async fn state(&self, id: &str) -> Result<Container, Error> {
         let args = vec![String::from("state"), String::from(id)];
-        Box::new(
-            self.command(&args, true)
-                .and_then(|(runc, output)| Ok((runc, serde_json::from_str(&output)?))),
-        )
+        let output = self.command(&args, true).await?;
+        Ok(serde_json::from_str(&output).context(JsonDeserializationError {})?)
     }
 
     /// Return the latest statistics for a container
-    pub fn stats(self, id: &str) -> Box<dyn Future<Item = (Self, Stats), Error = Error> + Send> {
+    pub async fn stats(&self, id: &str) -> Result<Stats, Error> {
         let args = vec![
             String::from("events"),
             String::from("--stats"),
             String::from(id),
         ];
-        Box::new(self.command(&args, true).and_then(|(runc, output)| {
-            let ev: Event = serde_json::from_str(&output)?;
-            if let Some(stats) = ev.stats {
-                Ok((runc, stats))
-            } else {
-                Err(Error::IoError(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "missing stats",
-                )))
-            }
-        }))
+        let output = self.command(&args, true).await?;
+        let ev: Event = serde_json::from_str(&output).context(JsonDeserializationError {})?;
+        ensure!(ev.stats.is_some(), MissingContainerStatsError {});
+        Ok(ev.stats.unwrap())
     }
 
     /// List all processes inside the container, returning the full ps data
-    pub fn top(
-        self,
-        id: &str,
-        ps_options: Option<&str>,
-    ) -> Box<dyn Future<Item = (Self, TopResults), Error = Error> + Send> {
+    pub async fn top(&self, id: &str, ps_options: Option<&str>) -> Result<TopResults, Error> {
         let mut args = vec![
             String::from("ps"),
             String::from("--format"),
@@ -466,250 +411,157 @@ impl Runc {
         if let Some(ps_options) = ps_options {
             args.push(String::from(ps_options));
         }
-        Box::new(self.command(&args, false).and_then(|(runc, output)| {
-            let lines: Vec<&str> = output.split('\n').collect();
-            if lines.is_empty() {
-                return Err(Error::IoError(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected short response from top",
-                )));
+        let output = self.command(&args, false).await?;
+        let lines: Vec<&str> = output.split('\n').collect();
+        ensure!(!lines.is_empty(), TopShortResponseError {});
+
+        let headers: Vec<String> = lines[0].split_whitespace().map(String::from).collect();
+        let pid_index = headers.iter().position(|x| x == "PID");
+        ensure!(pid_index.is_some(), TopMissingPidHeaderError {});
+
+        let mut processes: TopResults = Vec::new();
+
+        for line in lines.iter().skip(1) {
+            if line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields[pid_index.unwrap()] == "-" {
+                continue;
             }
 
-            let header_line = match lines.first() {
-                Some(header_line) => header_line,
-                None => {
-                    return Err(Error::IoError(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unable to find top header",
-                    )))
+            let mut process: Vec<&str> = Vec::from(&fields[..headers.len() - 1]);
+            let process_field = &fields[headers.len() - 1..].join(" ");
+            process.push(process_field);
+
+            let mut process_map: HashMap<String, String> = HashMap::new();
+            for j in 0..headers.len() {
+                if let Some(key) = headers.get(j) {
+                    if let Some(&value) = process.get(j) {
+                        process_map.insert(key.clone(), String::from(value));
+                    }
                 }
-            };
-            let headers: Vec<String> = header_line.split_whitespace().map(String::from).collect();
-            if let Some(pid_index) = headers.iter().position(|x| x == "PID") {
-                let mut processes: TopResults = Vec::new();
-
-                for line in lines.iter().skip(1) {
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let fields: Vec<&str> = line.split_whitespace().collect();
-                    if fields[pid_index] == "-" {
-                        continue;
-                    }
-
-                    let mut process: Vec<&str> = Vec::from(&fields[..headers.len() - 1]);
-                    let process_field = &fields[headers.len() - 1..].join(" ");
-                    process.push(process_field);
-
-                    let mut process_map: HashMap<String, String> = HashMap::new();
-                    for j in 0..headers.len() {
-                        if let Some(key) = headers.get(j) {
-                            if let Some(&value) = process.get(j) {
-                                process_map.insert(key.clone(), String::from(value));
-                            }
-                        }
-                    }
-                    processes.push(process_map);
-                }
-                Ok((runc, processes))
-            } else {
-                Err(Error::IoError(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unable to locate pid header",
-                )))
             }
-        }))
+            processes.push(process_map);
+        }
+        Ok(processes)
     }
 
     /// Update a container with the provided resource spec
-    pub fn update(
-        self,
-        id: &str,
-        resources: &LinuxResources,
-    ) -> Box<dyn Future<Item = Self, Error = Error> + Send> {
-        let temp_file = env::var_os("XDG_RUNTIME_DIR").and_then(|temp_dir| {
-            match temp_dir.to_string_lossy().parse() as Result<String, _> {
-                Ok(temp_dir) => Some(PathBuf::from(format!(
-                    "{}/runc-process-{}",
-                    temp_dir,
-                    Uuid::new_v4()
-                ))),
-                Err(_) => None,
-            }
-        });
-
-        let temp_file = match temp_file {
-            Some(p) => p,
-            None => {
-                return Box::new(err(Error::IoError(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "unable to create temporary spec file",
-                ))))
-            }
-        };
+    pub async fn update(&self, id: &str, resources: &LinuxResources) -> Result<(), Error> {
+        let temp_file = env::var_os("XDG_RUNTIME_DIR")
+            .and_then(
+                |temp_dir| match temp_dir.to_string_lossy().parse() as Result<String, _> {
+                    Ok(temp_dir) => Some(PathBuf::from(format!(
+                        "{}/runc-process-{}",
+                        temp_dir,
+                        Uuid::new_v4()
+                    ))),
+                    Err(_) => None,
+                },
+            )
+            .context(SpecFilePathError {})?;
 
         {
-            let spec_json = match serde_json::to_string(resources) {
-                Ok(spec_json) => spec_json,
-                Err(e) => return Box::new(err(e.into())),
-            };
-
-            let mut f = match File::create(temp_file.clone()) {
-                Ok(f) => f,
-                Err(e) => return Box::new(err(e.into())),
-            };
-
-            if let Err(e) = f.write(spec_json.as_bytes()) {
-                return Box::new(err(e.into()));
-            }
-            if let Err(e) = f.flush() {
-                return Box::new(err(e.into()));
-            }
+            let spec_json =
+                serde_json::to_string(resources).context(JsonDeserializationError {})?;
+            let mut f = File::create(temp_file.clone()).context(SpecFileCreationError {})?;
+            f.write(spec_json.as_bytes())
+                .context(SpecFileCreationError {})?;
+            f.flush().context(SpecFileCreationError {})?;
         }
 
-        let temp_file = match temp_file.to_string_lossy().parse() as Result<String, _> {
-            Ok(p) => p,
-            Err(_) => return Box::new(err(Error::UnicodeError)),
-        };
-
+        let temp_file: String = temp_file.to_string_lossy().parse().unwrap();
         let args = vec![
             String::from("update"),
             String::from("--resources"),
             temp_file.clone(),
             String::from(id),
         ];
-        Box::new(
-            Box::new(self.command(&args, true).map(|(runc, _)| runc)).then(move |res| {
-                if let Err(e) = fs::remove_file(temp_file) {
-                    return Err(e.into());
-                }
-                res
-            }),
-        )
+        let res = self.command(&args, true).await.map(|_| ());
+        fs::remove_file(temp_file).context(SpecFileCleanupError {})?;
+        res
     }
 
     /// Return the version of runc
-    pub fn version(self) -> Box<dyn Future<Item = (Self, Version), Error = Error> + Send> {
-        Box::new(
-            self.command(&[String::from("--version")], false)
-                .and_then(|(runc, output)| {
-                    let mut version = Version {
-                        runc_version: None,
-                        spec_version: None,
-                        commit: None,
-                    };
-                    for line in output.split('\n').take(3).map(|line| line.trim()) {
-                        if line.contains("version") {
-                            version.runc_version = Some(match line.split("version ").nth(1) {
-                                Some(runc) => String::from(runc),
-                                None => {
-                                    return Err(Error::IoError(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "unable to parse runc version",
-                                    )))
-                                }
-                            });
-                        } else if line.contains("spec") {
-                            version.spec_version = Some(match line.split(": ").nth(1) {
-                                Some(spec) => String::from(spec),
-                                None => {
-                                    return Err(Error::IoError(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "unable to parse spec version",
-                                    )))
-                                }
-                            });
-                        } else if line.contains("commit") {
-                            version.commit = Some(match line.split(": ").nth(1) {
-                                Some(commit) => String::from(commit),
-                                None => {
-                                    return Err(Error::IoError(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "unable to parse commit hash",
-                                    )))
-                                }
-                            });
-                        }
-                    }
-                    Ok((runc, version))
-                }),
-        )
+    pub async fn version(&self) -> Result<Version, Error> {
+        let output = self.command(&[String::from("--version")], false).await?;
+        let mut version = Version {
+            runc_version: None,
+            spec_version: None,
+            commit: None,
+        };
+        for line in output.split('\n').take(3).map(|line| line.trim()) {
+            if line.contains("version") {
+                version.runc_version = Some(
+                    line.split("version ")
+                        .nth(1)
+                        .map(String::from)
+                        .context(RuncInvalidVersionError {})?,
+                );
+            } else if line.contains("spec") {
+                version.spec_version = Some(
+                    line.split(": ")
+                        .nth(1)
+                        .map(String::from)
+                        .context(RuncInvalidSpecVersionError {})?,
+                );
+            } else if line.contains("commit") {
+                version.commit = line.split(": ").nth(1).map(String::from);
+            }
+        }
+        Ok(version)
     }
 
-    fn command(
-        self,
-        args: &[String],
-        combined_output: bool,
-    ) -> Box<dyn Future<Item = (Self, String), Error = Error> + Send> {
-        let args = match self.concat_args(args) {
-            Ok(a) => a,
-            Err(e) => return Box::new(err(e)),
-        };
+    async fn command(&self, args: &[String], combined_output: bool) -> Result<String, Error> {
+        let args = self.concat_args(args)?;
         let process = Command::new(&self.command)
             .args(&args.clone())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn_async();
-        let timeout = self.timeout;
-        match process {
-            Ok(process) => Box::new(
-                process
-                    .wait_with_output()
-                    .from_err::<Error>()
-                    .and_then(move |result| {
-                        if result.status.success() {
-                            Ok((
-                                self,
-                                String::from_utf8(if combined_output {
-                                    let mut combined = result.stdout.clone();
-                                    combined.append(&mut result.stderr.clone());
-                                    combined
-                                } else {
-                                    result.stdout
-                                })?,
-                            ))
-                        } else {
-                            let stdout = String::from_utf8(result.stdout.clone())?;
-                            let stderr = String::from_utf8(result.stderr.clone())?;
-                            error!("runc command execution failed, args = {:?}, stdout = '{}', stderr = '{}'", args, stdout, stderr);
-                            Err(Error::IoError(io::Error::new(
-                                io::ErrorKind::Other,
-                                "runc command execution failed",
-                            )))
-                        }
-                    })
-                    .timeout(timeout)
-                    .from_err::<Error>(),
-            ),
-            Err(e) => Box::new(err(Error::IoError(e))),
-        }
+            .spawn()
+            .context(ProcessSpawnError {})?;
+
+        let result = timeout(self.timeout, process.wait_with_output())
+            .await
+            .context(RuncCommandTimeoutError {})?
+            .context(RuncCommandError {})?;
+
+        let stdout = String::from_utf8(result.stdout.clone()).context(UnicodeConversionError {})?;
+        let stderr = String::from_utf8(result.stderr.clone()).context(UnicodeConversionError {})?;
+        ensure!(
+            result.status.success(),
+            RuncCommandFailedError {
+                stdout: stdout,
+                stderr: stderr
+            }
+        );
+
+        Ok(if combined_output {
+            let mut combined = String::new();
+            combined.push_str(&stdout);
+            combined.push_str(&stderr);
+            combined
+        } else {
+            stdout
+        })
     }
 
-    fn command_with_streaming_output(
-        self,
+    async fn command_with_streaming_output(
+        &self,
         args: &[String],
         combined_output: bool,
-    ) -> Box<dyn Future<Item = (Self, ConsoleStream), Error = Error> + Send> {
+    ) -> Result<ConsoleStream, Error> {
+        let args = self.concat_args(args)?;
         let process = Command::new(&self.command)
-            .args(match self.concat_args(args) {
-                Ok(a) => a,
-                Err(e) => return Box::new(err(e)),
-            })
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn_async();
-        match process {
-            Ok(process) => {
-                let console_stream = match ConsoleStream::new(process, combined_output) {
-                    Ok(console_stream) => console_stream,
-                    Err(e) => return Box::new(err(e)),
-                };
-                Box::new(ok((self, console_stream)))
-            }
-            Err(e) => Box::new(err(Error::IoError(e))),
-        }
+            .spawn()
+            .context(ProcessSpawnError {})?;
+        ConsoleStream::new(process, combined_output)
     }
 
     fn concat_args(&self, args: &[String]) -> Result<Vec<String>, Error> {
@@ -746,14 +598,20 @@ impl Args for Runc {
         let mut args: Vec<String> = Vec::new();
         if let Some(root) = self.root.clone() {
             args.push(String::from("--root"));
-            args.push(root.canonicalize()?.to_string_lossy().parse()?);
+            args.push(
+                root.canonicalize()
+                    .context(InvalidPathError {})?
+                    .to_string_lossy()
+                    .parse()
+                    .unwrap(),
+            );
         }
         if self.debug {
             args.push(String::from("--debug"));
         }
         if let Some(log) = self.log.clone() {
             args.push(String::from("--log"));
-            args.push(log.to_string_lossy().parse()?);
+            args.push(log.to_string_lossy().parse().unwrap());
         }
         if let Some(log_format) = self.log_format.clone() {
             args.push(String::from("--log-format"));
@@ -773,23 +631,22 @@ impl Args for Runc {
 }
 
 // Clean up after tests
+#[cfg(test)]
 impl Drop for Runc {
     fn drop(&mut self) {
-        if self.should_cleanup {
-            if let Some(root) = self.root.clone() {
-                if let Err(e) = fs::remove_dir_all(&root) {
-                    warn!("failed to cleanup root directory: {}", e);
+        if let Some(root) = self.root.clone() {
+            if let Err(e) = fs::remove_dir_all(&root) {
+                warn!("failed to cleanup root directory: {}", e);
+            }
+        }
+        if let Some(system_runc) = Self::runc_binary() {
+            if system_runc != self.command {
+                if let Err(e) = fs::remove_file(&self.command) {
+                    warn!("failed to remove runc binary: {}", e);
                 }
             }
-            if let Some(system_runc) = Self::runc_binary() {
-                if system_runc != self.command {
-                    if let Err(e) = fs::remove_file(&self.command) {
-                        warn!("failed to remove runc binary: {}", e);
-                    }
-                }
-            } else if let Err(e) = fs::remove_file(&self.command) {
-                warn!("failed to remove runc binary: {}", e);
-            }
+        } else if let Err(e) = fs::remove_file(&self.command) {
+            warn!("failed to remove runc binary: {}", e);
         }
     }
 }
@@ -814,11 +671,18 @@ impl Args for CreateOpts {
         let mut args: Vec<String> = Vec::new();
         if let Some(pid_file) = self.pid_file.clone() {
             args.push(String::from("--pid-file"));
-            args.push(pid_file.to_string_lossy().parse()?)
+            args.push(pid_file.to_string_lossy().parse().unwrap())
         }
         if let Some(console_socket) = self.console_socket.clone() {
             args.push(String::from("--console-socket"));
-            args.push(console_socket.canonicalize()?.to_string_lossy().parse()?)
+            args.push(
+                console_socket
+                    .canonicalize()
+                    .context(InvalidPathError {})?
+                    .to_string_lossy()
+                    .parse()
+                    .unwrap(),
+            )
         }
         if self.no_pivot {
             args.push(String::from("--no-pivot"));
@@ -866,14 +730,21 @@ impl Args for ExecOpts {
         let mut args: Vec<String> = Vec::new();
         if let Some(console_socket) = self.console_socket.clone() {
             args.push(String::from("--console-socket"));
-            args.push(console_socket.canonicalize()?.to_string_lossy().parse()?);
+            args.push(
+                console_socket
+                    .canonicalize()
+                    .context(InvalidPathError {})?
+                    .to_string_lossy()
+                    .parse()
+                    .unwrap(),
+            );
         }
         if self.detach {
             args.push(String::from("--detach"));
         }
         if let Some(pid_file) = self.pid_file.clone() {
             args.push(String::from("--pid-file"));
-            args.push(pid_file.to_string_lossy().parse()?);
+            args.push(pid_file.to_string_lossy().parse().unwrap());
         }
         Ok(args)
     }
@@ -908,59 +779,50 @@ impl EventStream {
 }
 
 impl Stream for EventStream {
-    type Item = Event;
-    type Error = Error;
+    type Item = Result<Event, Error>;
 
-    fn poll(&mut self) -> Result<Async<Option<Self::Item>>, Self::Error> {
-        let line = try_ready!(self.inner.poll());
-        if let Some(line) = line {
-            let ev: Event = serde_json::from_str(&line)?;
-            Ok(Async::Ready(Some(ev)))
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(Ok(line)) = ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+            Poll::Ready(Some(
+                serde_json::from_str(&line).context(JsonDeserializationError {}),
+            ))
         } else {
-            Ok(Async::Ready(None))
+            Poll::Ready(None)
         }
     }
 }
 
 struct ConsoleStream {
     process: Child,
-    combined_output: bool,
-    stdout: BufReader<ChildStdout>,
-    stderr: BufReader<ChildStderr>,
-    stdout_buf: Vec<u8>,
-    stderr_buf: Vec<u8>,
+    inner: Pin<Box<dyn Stream<Item = tokio::io::Result<String>>>>,
 }
 
 impl ConsoleStream {
     fn new(mut process: Child, combined_output: bool) -> Result<Self, Error> {
-        let stdout = if let Some(stdout) = process.stdout().take() {
-            BufReader::new(stdout)
+        let stdout = BufReader::new(process.stdout.take().unwrap()).lines();
+        let inner: Pin<Box<dyn Stream<Item = tokio::io::Result<String>>>> = if combined_output {
+            let stderr = BufReader::new(process.stderr.take().unwrap()).lines();
+            Box::pin(stdout.merge(stderr))
         } else {
-            return Err(Error::IoError(io::Error::new(
-                io::ErrorKind::NotFound,
-                "missing stdout handle",
-            )));
+            Box::pin(stdout)
         };
-        let stderr = if let Some(stderr) = process.stderr().take() {
-            BufReader::new(stderr)
-        } else {
-            return Err(Error::IoError(io::Error::new(
-                io::ErrorKind::NotFound,
-                "missing stderr handle",
-            )));
-        };
-        Ok(Self {
-            process,
-            combined_output,
-            stdout,
-            stderr,
-            stdout_buf: vec![],
-            stderr_buf: vec![],
-        })
+        Ok(Self { process, inner })
     }
 }
 
 impl Stream for ConsoleStream {
+    type Item = tokio::io::Result<String>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(line) = ready!(self.inner.as_mut().poll_next(cx)) {
+            Poll::Ready(Some(line))
+        } else {
+            Poll::Ready(None)
+        }
+    }
+}
+
+/*impl Stream for ConsoleStream {
     type Item = String;
     type Error = Error;
 
@@ -1007,7 +869,7 @@ impl Stream for ConsoleStream {
             }
         }
     }
-}
+}*/
 
 impl Drop for ConsoleStream {
     fn drop(&mut self) {
@@ -1019,22 +881,17 @@ impl Drop for ConsoleStream {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
-    use std::ops::Add;
-    use std::thread;
-    use std::time::Instant;
-
-    use flate2::read::GzDecoder;
-    use futures::future::FutureResult;
-    use futures::lazy;
-    use tar::Archive;
-    use tokio::runtime::Runtime;
-    use tokio::timer::Delay;
-
+    use super::*;
     use crate::console::ReceivePtyMaster;
     use crate::specs::{LinuxCapabilities, LinuxMemory, POSIXRlimit, User};
-
-    use super::*;
+    use flate2::read::GzDecoder;
+    use futures::executor::block_on;
+    use futures::StreamExt;
+    use log::error;
+    use tar::Archive;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::runtime::Runtime;
+    use tokio::time::delay_for;
 
     #[test]
     fn test_create() {
@@ -1046,66 +903,56 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(
-            move || -> Box<dyn Future<Item = (Runc, Container), Error = Error> + Send> {
-                let mut config: RuncConfiguration = Default::default();
-                config.command = Some(runc_path.clone());
-                config.root = Some(runc_root.clone());
-                config.should_cleanup = true;
-                let runc = match Runc::new(config) {
-                    Ok(runc) => runc,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path);
+        config.root = Some(runc_root);
+        let runc = Runc::new(config).expect("Unable to create runc instance");
 
-                let id = format!("{}", Uuid::new_v4());
-                let console_socket = env::temp_dir().join(&id).with_extension("console");
-                let receive_pty_master = match ReceivePtyMaster::new(&console_socket) {
-                    Ok(receive_pty_master) => receive_pty_master,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let task = async move {
+            let id = format!("{}", Uuid::new_v4());
 
-                // As an ugly hack leak the pty master handle for the lifecycle of the test
-                // we can't close it and we also don't want to block on it (can interfere with deletes)
-                tokio::spawn(
-                    receive_pty_master
-                        .and_then(|pty_master| {
-                            Box::leak(Box::new(pty_master));
-                            Ok(())
-                        })
-                        .map_err(|_| ()),
-                );
-
-                let bundle = env::temp_dir().join(&id);
-                if let Err(e) =
-                    extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
-                {
-                    return Box::new(err(e.into()));
+            // As an ugly hack leak the pty master handle for the lifecycle of the test process
+            // we can't close it and we also don't want to block on it (can interfere with deletes)
+            let console_socket = env::temp_dir().join(&id).with_extension("console");
+            let receive_pty_master = ReceivePtyMaster::new(&console_socket)?;
+            tokio::spawn(async move {
+                match receive_pty_master.receive().await {
+                    Ok(pty_master) => {
+                        Box::leak(Box::new(pty_master));
+                    }
+                    Err(err) => {
+                        error!("Receive PTY master error: {}", err);
+                    }
                 }
+            });
 
-                Box::new(
-                    runc.create(
-                        &id,
-                        &bundle,
-                        Some(&CreateOpts {
-                            pid_file: None,
-                            console_socket: Some(console_socket),
-                            no_pivot: false,
-                            no_new_keyring: false,
-                            detach: false,
-                        }),
-                    )
-                    .and_then(move |runc| runc.state(&id)),
-                )
-            },
-        );
+            let bundle = env::temp_dir().join(&id);
+            extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
+                .context(BundleExtractError {})?;
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, container) = runtime.block_on_all(task).expect("test failed");
+            runc.create(
+                &id,
+                &bundle,
+                Some(&CreateOpts {
+                    pid_file: None,
+                    console_socket: Some(console_socket),
+                    no_pivot: false,
+                    no_new_keyring: false,
+                    detach: false,
+                }),
+            )
+            .await?;
+
+            runc.state(&id).await
+        };
+
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let container = runtime.block_on(task).expect("test failed");
 
         assert_eq!(container.status, Some(String::from("created")));
     }
@@ -1120,50 +967,32 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(|| {
-            ManagedContainer::new(
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path.clone());
+        config.root = Some(runc_root.clone());
+        let runc = Runc::new(config).expect("Unable to create runc instance");
+
+        let task = async move {
+            let container = ManagedContainer::new(
                 &runc_path,
                 &runc_root,
                 &PathBuf::from("test_fixture/busybox.tar.gz"),
             )
-            .and_then(
-                move |container| -> Box<
-                    dyn Future<Item = (Runc, String, Vec<Container>), Error = Error> + Send,
-                > {
-                    let mut config: RuncConfiguration = Default::default();
-                    config.command = Some(runc_path.clone());
-                    config.root = Some(runc_root.clone());
-                    config.should_cleanup = true;
-                    let runc = match Runc::new(config) {
-                        Ok(runc) => runc,
-                        Err(e) => return Box::new(err(e)),
-                    };
+            .await?;
 
-                    let delete_id = container.id.clone();
-                    Box::new(
-                        runc.kill(&container.id, libc::SIGKILL, None)
-                            .and_then(move |runc| {
-                                thread::sleep(Duration::from_millis(500));
-                                runc.delete(&delete_id, None)
-                            })
-                            .and_then(move |runc| {
-                                runc.list().and_then(move |(runc, containers)| {
-                                    // Hack to keep the container from being prematurely dropped
-                                    Ok((runc, container.id.clone(), containers))
-                                })
-                            }),
-                    )
-                },
-            )
-        });
+            runc.kill(&container.id, libc::SIGKILL, None).await?;
+            delay_for(Duration::from_millis(500)).await;
+            runc.delete(&container.id, None).await?;
+            runc.list().await
+        };
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, _, containers) = runtime.block_on_all(task).expect("test failed");
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let containers = runtime.block_on(task).expect("test failed");
 
         assert!(containers.is_empty());
     }
@@ -1178,44 +1007,36 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(|| {
-            ManagedContainer::new(
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path.clone());
+        config.root = Some(runc_root.clone());
+        let runc = Runc::new(config).expect("Unable to create runc instance");
+
+        let task = async move {
+            let container = ManagedContainer::new(
                 &runc_path,
                 &runc_root,
                 &PathBuf::from("test_fixture/busybox.tar.gz"),
             )
-            .and_then(
-                move |container| -> Box<
-                    dyn Future<Item = (Runc, String, Vec<Event>), Error = Error> + Send,
-                > {
-                    let mut config: RuncConfiguration = Default::default();
-                    config.command = Some(runc_path.clone());
-                    config.root = Some(runc_root.clone());
-                    config.should_cleanup = true;
-                    let runc = match Runc::new(config) {
-                        Ok(runc) => runc,
-                        Err(e) => return Box::new(err(e)),
-                    };
+            .await?;
 
-                    Box::new(
-                        runc.events(&container.id, &Duration::from_secs(1))
-                            .and_then(|(runc, events)| {
-                                events.take(3).collect().and_then(move |events| {
-                                    Ok((runc, container.id.clone(), events))
-                                })
-                            }),
-                    )
-                },
+            let events = runc.events(&container.id, &Duration::from_secs(1)).await?;
+            Ok::<_, Error>(
+                events
+                    .take(3)
+                    .map(|event| event.unwrap())
+                    .collect::<Vec<Event>>()
+                    .await,
             )
-        });
+        };
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, _, events) = runtime.block_on_all(task).expect("test failed");
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let events = runtime.block_on(task).expect("test failed");
 
         assert_eq!(events.len(), 3);
 
@@ -1246,129 +1067,125 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(
-            move || -> Box<dyn Future<Item = (Runc, TopResults), Error = Error> + Send> {
-                let mut config: RuncConfiguration = Default::default();
-                config.command = Some(runc_path.clone());
-                config.root = Some(runc_root.clone());
-                config.should_cleanup = true;
-                let runc = match Runc::new(config) {
-                    Ok(runc) => runc,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path);
+        config.root = Some(runc_root);
+        let runc = Runc::new(config).expect("Unable to create runc instance");
 
-                let id = format!("{}", Uuid::new_v4());
-                let console_socket = env::temp_dir().join(&id).with_extension("console");
-                let receive_pty_master = match ReceivePtyMaster::new(&console_socket) {
-                    Ok(receive_pty_master) => receive_pty_master,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let task = async move {
+            let id = format!("{}", Uuid::new_v4());
 
-                // As an ugly hack leak the pty master handle for the lifecycle of the test
-                // we can't close it and we also don't want to block on it (can interfere with deletes)
-                tokio::spawn(
-                    receive_pty_master
-                        .and_then(|pty_master| {
-                            Box::leak(Box::new(pty_master));
-                            Ok(())
-                        })
-                        .map_err(|_| ()),
-                );
-
-                let additional_console_socket =
-                    env::temp_dir().join(&id).with_extension("console2");
-                let receive_additional_pty_master =
-                    match ReceivePtyMaster::new(&additional_console_socket) {
-                        Ok(receive_additional_pty_master) => receive_additional_pty_master,
-                        Err(e) => return Box::new(err(e)),
-                    };
-
-                // As an ugly hack leak the pty master handle for the lifecycle of the test
-                // we can't close it and we also don't want to block on it (can interfere with deletes)
-                tokio::spawn(
-                    receive_additional_pty_master
-                        .and_then(|pty_master| {
-                            Box::leak(Box::new(pty_master));
-                            Ok(())
-                        })
-                        .map_err(|_| ()),
-                );
-
-                let bundle = env::temp_dir().join(&id);
-                if let Err(e) =
-                    extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
-                {
-                    return Box::new(err(e.into()));
+            // As an ugly hack leak the pty master handle for the lifecycle of the test process
+            // we can't close it and we also don't want to block on it (can interfere with deletes)
+            let console_socket = env::temp_dir().join(&id).with_extension("console");
+            let receive_pty_master = ReceivePtyMaster::new(&console_socket)?;
+            tokio::spawn(async move {
+                match receive_pty_master.receive().await {
+                    Ok(pty_master) => {
+                        Box::leak(Box::new(pty_master));
+                    }
+                    Err(err) => {
+                        error!("Receive PTY master error: {}", err);
+                    }
                 }
+            });
 
-                let capabilities = Some(vec![
-                    String::from("CAP_AUDIT_WRITE"),
-                    String::from("CAP_KILL"),
-                    String::from("CAP_NET_BIND_SERVICE"),
-                ]);
+            // As an ugly hack leak the pty master handle for the lifecycle of the test process
+            // we can't close it and we also don't want to block on it (can interfere with deletes)
+            let additional_console_socket = env::temp_dir().join(&id).with_extension("console2");
+            let receive_additional_pty_master = ReceivePtyMaster::new(&additional_console_socket)?;
+            tokio::spawn(async move {
+                match receive_additional_pty_master.receive().await {
+                    Ok(pty_master) => {
+                        Box::leak(Box::new(pty_master));
+                    }
+                    Err(err) => {
+                        error!("Receive additional PTY master error: {}", err);
+                    }
+                }
+            });
 
-                Box::new(
-                    runc.create(
-                        &id,
-                        &bundle,
-                        Some(&CreateOpts {
-                            pid_file: None,
-                            console_socket: Some(console_socket),
-                            no_pivot: false,
-                            no_new_keyring: false,
-                            detach: false,
-                        }),
-                    )
-                        .and_then(move |runc| {
-                            runc.exec(&id, &Process{
-                                terminal: Some(true),
-                                console_size: None,
-                                user: Some(User{
-                                    uid: Some(0),
-                                    gid: Some(0),
-                                    additional_gids: None,
-                                    username: None
-                                }),
-                                args: Some(vec![String::from("sleep"), String::from("10")]),
-                                command_line: None,
-                                env: Some(vec![String::from("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"), String::from("TERM=xterm")]),
-                                cwd: Some(String::from("/")),
-                                capabilities: Some(LinuxCapabilities{
-                                    bounding: capabilities.clone(),
-                                    effective: capabilities.clone(),
-                                    inheritable: capabilities.clone(),
-                                    permitted: capabilities.clone(),
-                                    ambient: capabilities.clone()
-                                }),
-                                rlimits: Some(vec![POSIXRlimit{
-                                    limit_type: Some(String::from("RLIMIT_NOFILE")),
-                                    hard: Some(1024),
-                                    soft: Some(1024)
-                                }]),
-                                no_new_privileges: Some(false),
-                                app_armor_profile: None,
-                                oom_score_adj: None,
-                                selinux_label: None
-                            }, Some(&ExecOpts{
-                                pid_file: Some(PathBuf::from("/tmp/bang.pid")),
-                                console_socket: Some(additional_console_socket),
-                                detach: true
-                            })).and_then(move |runc| {
-                                thread::sleep(Duration::from_millis(500));
-                                runc.top(&id, None).and_then(move |(runc, processes)| runc.kill(&id, libc::SIGKILL, None).and_then(move |runc| Ok((runc, processes))))
-                            })
-                        }),
-                )
-            },
-        );
+            let bundle = env::temp_dir().join(&id);
+            extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
+                .context(BundleExtractError {})?;
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, processes) = runtime.block_on_all(task).expect("test failed");
+            let capabilities = Some(vec![
+                String::from("CAP_AUDIT_WRITE"),
+                String::from("CAP_KILL"),
+                String::from("CAP_NET_BIND_SERVICE"),
+            ]);
+
+            runc.create(
+                &id,
+                &bundle,
+                Some(&CreateOpts {
+                    pid_file: None,
+                    console_socket: Some(console_socket),
+                    no_pivot: false,
+                    no_new_keyring: false,
+                    detach: false,
+                }),
+            )
+            .await?;
+
+            runc.exec(
+                &id,
+                &Process {
+                    terminal: Some(true),
+                    console_size: None,
+                    user: Some(User {
+                        uid: Some(0),
+                        gid: Some(0),
+                        additional_gids: None,
+                        username: None,
+                    }),
+                    args: Some(vec![String::from("sleep"), String::from("10")]),
+                    command_line: None,
+                    env: Some(vec![
+                        String::from(
+                            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                        ),
+                        String::from("TERM=xterm"),
+                    ]),
+                    cwd: Some(String::from("/")),
+                    capabilities: Some(LinuxCapabilities {
+                        bounding: capabilities.clone(),
+                        effective: capabilities.clone(),
+                        inheritable: capabilities.clone(),
+                        permitted: capabilities.clone(),
+                        ambient: capabilities.clone(),
+                    }),
+                    rlimits: Some(vec![POSIXRlimit {
+                        limit_type: Some(String::from("RLIMIT_NOFILE")),
+                        hard: Some(1024),
+                        soft: Some(1024),
+                    }]),
+                    no_new_privileges: Some(false),
+                    app_armor_profile: None,
+                    oom_score_adj: None,
+                    selinux_label: None,
+                },
+                Some(&ExecOpts {
+                    pid_file: Some(PathBuf::from("/tmp/bang.pid")),
+                    console_socket: Some(additional_console_socket),
+                    detach: true,
+                }),
+            )
+            .await?;
+
+            delay_for(Duration::from_millis(500)).await;
+            let processes = runc.top(&id, None).await?;
+            runc.kill(&id, libc::SIGKILL, None).await?;
+            Ok::<_, Error>(processes)
+        };
+
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let processes = runtime.block_on(task).expect("test failed");
 
         assert_ne!(
             processes
@@ -1392,45 +1209,31 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(|| {
-            ManagedContainer::new(
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path.clone());
+        config.root = Some(runc_root.clone());
+        let runc = Runc::new(config).expect("Unable to create runc instance");
+
+        let task = async move {
+            let container = ManagedContainer::new(
                 &runc_path,
                 &runc_root,
                 &PathBuf::from("test_fixture/busybox.tar.gz"),
             )
-            .and_then(
-                move |container| -> Box<
-                    dyn Future<Item = (Runc, String, Container), Error = Error> + Send,
-                > {
-                    let mut config: RuncConfiguration = Default::default();
-                    config.command = Some(runc_path.clone());
-                    config.root = Some(runc_root.clone());
-                    config.should_cleanup = true;
-                    let runc = match Runc::new(config) {
-                        Ok(runc) => runc,
-                        Err(e) => return Box::new(err(e)),
-                    };
-                    Box::new(
-                        runc.kill(&container.id, libc::SIGKILL, None)
-                            .and_then(move |runc| {
-                                thread::sleep(Duration::from_millis(500));
-                                runc.state(&container.id).and_then(move |(runc, state)| {
-                                    // container reference here is a kludge to avoid dropping the object early
-                                    Ok((runc, container.id.clone(), state))
-                                })
-                            }),
-                    )
-                },
-            )
-        });
+            .await?;
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, _, state) = runtime.block_on_all(task).expect("test failed");
+            runc.kill(&container.id, libc::SIGKILL, None).await?;
+            delay_for(Duration::from_millis(500)).await;
+            runc.state(&container.id).await
+        };
+
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let state = runtime.block_on(task).expect("test failed");
 
         assert_eq!(state.status, Some(String::from("stopped")));
     }
@@ -1445,53 +1248,47 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(|| {
-            ManagedContainer::new(
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path.clone());
+        config.root = Some(runc_root.clone());
+        let runc = Runc::new(config).expect("Unable to create runc instance");
+
+        let task = async move {
+            let container = ManagedContainer::new(
                 &runc_path,
                 &runc_root,
                 &PathBuf::from("test_fixture/busybox.tar.gz"),
             )
-            .and_then(
-                move |container| -> Box<dyn Future<Item = Runc, Error = Error> + Send> {
-                    let mut config: RuncConfiguration = Default::default();
-                    config.command = Some(runc_path.clone());
-                    config.root = Some(runc_root.clone());
-                    config.should_cleanup = true;
-                    let runc = match Runc::new(config) {
-                        Ok(runc) => runc,
-                        Err(e) => return Box::new(err(e)),
-                    };
+            .await
+            .unwrap();
 
-                    Box::new(runc.list().and_then(move |(runc, containers)| {
-                        if containers.len() != 1 {
-                            return Err(Error::IoError(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "expected a single container",
-                            )));
-                        }
-                        if let Some(container_item) = containers.get(0) {
-                            if let Some(id) = container_item.id.clone() {
-                                if id == container.id {
-                                    return Ok(runc);
-                                }
-                            }
-                        }
-                        Err(Error::IoError(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "expected container to match",
-                        )))
-                    }))
-                },
-            )
-        });
+            let containers = runc.list().await.unwrap();
+            if containers.len() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected a single container",
+                ));
+            }
+            if let Some(container_item) = containers.get(0) {
+                if let Some(id) = container_item.id.clone() {
+                    if id == container.id {
+                        return Ok(runc);
+                    }
+                }
+            }
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected container to match",
+            ))
+        };
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        runtime.block_on_all(task).expect("test failed");
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        runtime.block_on(task).expect("test failed");
     }
 
     #[test]
@@ -1504,31 +1301,35 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(|| {
-            ManagedContainer::new(&runc_path, &runc_root, &PathBuf::from("test_fixture/busybox.tar.gz"))
-                .and_then(move |container| -> Box<dyn Future<Item = (Runc, Container), Error = Error> + Send> {
-                    let mut config: RuncConfiguration = Default::default();
-                    config.command = Some(runc_path.clone());
-                    config.root = Some(runc_root.clone());
-                    config.should_cleanup = true;
-                    let runc = match Runc::new(config) {
-                        Ok(runc) => runc,
-                        Err(e) => return Box::new(err(e)),
-                    };
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path.clone());
+        config.root = Some(runc_root.clone());
+        let runc = Runc::new(config).expect("Unable to create runc instance");
 
-                    Box::new(runc.pause(&container.id).and_then(move |runc| runc.state(&container.id)))
-                })
-        });
+        let task = async move {
+            let container = ManagedContainer::new(
+                &runc_path,
+                &runc_root,
+                &PathBuf::from("test_fixture/busybox.tar.gz"),
+            )
+            .await?;
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, container) = runtime.block_on_all(task).expect("test failed");
+            runc.pause(&container.id).await?;
+            let container_state = runc.state(&container.id).await?;
+            // Can't seem to kill/delete a paused container
+            runc.resume(&container.id).await?;
+            Ok::<_, Error>(container_state)
+        };
 
-        assert_eq!(container.status, Some(String::from("paused")));
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let container_state = runtime.block_on(task).expect("test failed");
+
+        assert_eq!(container_state.status, Some(String::from("paused")));
     }
 
     #[test]
@@ -1541,56 +1342,58 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(|| {
-            ManagedContainer::new(
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path.clone());
+        config.root = Some(runc_root.clone());
+        let runc = Runc::new(config).expect("Unable to create runc instance");
+
+        let task = async move {
+            let container = ManagedContainer::new(
                 &runc_path,
                 &runc_root,
                 &PathBuf::from("test_fixture/busybox.tar.gz"),
             )
-            .and_then(
-                move |container| -> Box<dyn Future<Item = Runc, Error = Error> + Send> {
-                    let mut config: RuncConfiguration = Default::default();
-                    config.command = Some(runc_path.clone());
-                    config.root = Some(runc_root.clone());
-                    config.should_cleanup = true;
-                    let runc = match Runc::new(config) {
-                        Ok(runc) => runc,
-                        Err(e) => return Box::new(err(e)),
-                    };
+            .await
+            .unwrap();
 
-                    // Time for shell to spawn
-                    thread::sleep(Duration::from_millis(100));
+            // Time for shell to spawn
+            delay_for(Duration::from_millis(100)).await;
 
-                    Box::new(runc.ps(&container.id).and_then(|(runc, processes)| {
-                        if processes.len() != 1 {
-                            Err(Error::IoError(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "expected a single shell process",
-                            )))
-                        } else if let Some(pid) = processes.get(0) {
-                            if *pid > 0 && *pid < 32768 {
-                                Ok(runc)
-                            } else {
-                                Err(Error::IoError(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "invalid pid number",
-                                )))
-                            }
-                        } else {
-                            Err(Error::Unknown)
-                        }
-                    }))
-                },
-            )
-        });
+            let res = runc.ps(&container.id).await;
+            if let Err(err) = res {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("failed to run ps command: {}", err),
+                ));
+            }
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        runtime.block_on_all(task).expect("test failed");
+            let processes = res.unwrap();
+            if processes.len() != 1 {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected a single shell process",
+                ))
+            } else if let Some(pid) = processes.get(0) {
+                if *pid > 0 && *pid < 32768 {
+                    Ok::<_, io::Error>(runc)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid pid number",
+                    ))
+                }
+            } else {
+                Err(io::Error::new(io::ErrorKind::Other, ""))
+            }
+        };
+
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        runtime.block_on(task).expect("test failed");
     }
 
     #[test]
@@ -1603,36 +1406,36 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(|| {
-            ManagedContainer::new(&runc_path, &runc_root, &PathBuf::from("test_fixture/busybox.tar.gz"))
-                .and_then(move |container| -> Box<dyn Future<Item = (Runc, Container), Error = Error> + Send> {
-                    let mut config: RuncConfiguration = Default::default();
-                    config.command = Some(runc_path.clone());
-                    config.root = Some(runc_root.clone());
-                    config.should_cleanup = true;
-                    let runc = match Runc::new(config) {
-                        Ok(runc) => runc,
-                        Err(e) => return Box::new(err(e)),
-                    };
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path.clone());
+        config.root = Some(runc_root.clone());
+        let runc = Runc::new(config).expect("Unable to create runc instance");
 
-                    Box::new(runc.pause(&container.id).and_then(move |runc| runc.state(&container.id).and_then(move |(runc, state)| {
-                        if let Some(status) = state.status {
-                            if status == "paused" {
-                                return Ok((runc, container.id.clone()));
-                            }
-                        }
-                        Err(Error::IoError(io::Error::new(io::ErrorKind::InvalidData, "expected container to be paused")))
-                    }).and_then(move |(runc, id)| runc.resume(&id).and_then(move |runc| runc.state(&id)))))
-                })
-        });
+        let task = async move {
+            let container = ManagedContainer::new(
+                &runc_path,
+                &runc_root,
+                &PathBuf::from("test_fixture/busybox.tar.gz"),
+            )
+            .await?;
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, container) = runtime.block_on_all(task).expect("test failed");
+            runc.pause(&container.id).await?;
+
+            let container_state = runc.state(&container.id).await?;
+            let status = container_state.status.unwrap();
+            assert_eq!(status, "paused");
+
+            runc.resume(&container.id).await?;
+            runc.state(&container.id).await
+        };
+
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let container = runtime.block_on(task).expect("test failed");
 
         assert_eq!(container.status, Some(String::from("running")));
     }
@@ -1647,69 +1450,58 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(
-            move || -> Box<dyn Future<Item = (Runc, Container), Error = Error> + Send> {
-                let mut config: RuncConfiguration = Default::default();
-                config.command = Some(runc_path.clone());
-                config.root = Some(runc_root.clone());
-                config.should_cleanup = true;
-                let runc = match Runc::new(config) {
-                    Ok(runc) => runc,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path);
+        config.root = Some(runc_root);
+        let runc = Runc::new(config).expect("Unable to create runc instance");
 
-                let id = format!("{}", Uuid::new_v4());
-                let console_socket = env::temp_dir().join(&id).with_extension("console");
-                let receive_pty_master = match ReceivePtyMaster::new(&console_socket) {
-                    Ok(receive_pty_master) => receive_pty_master,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let task = async move {
+            let id = format!("{}", Uuid::new_v4());
 
-                // As an ugly hack leak the pty master handle for the lifecycle of the test
-                // we can't close it and we also don't want to block on it (can interfere with deletes)
-                tokio::spawn(
-                    receive_pty_master
-                        .and_then(|pty_master| {
-                            Box::leak(Box::new(pty_master));
-                            Ok(())
-                        })
-                        .map_err(|_| ()),
-                );
-
-                let bundle = env::temp_dir().join(&id);
-                if let Err(e) =
-                    extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
-                {
-                    return Box::new(err(e.into()));
+            // As an ugly hack leak the pty master handle for the lifecycle of the test process
+            // we can't close it and we also don't want to block on it (can interfere with deletes)
+            let console_socket = env::temp_dir().join(&id).with_extension("console");
+            let receive_pty_master = ReceivePtyMaster::new(&console_socket)?;
+            tokio::spawn(async move {
+                match receive_pty_master.receive().await {
+                    Ok(pty_master) => {
+                        Box::leak(Box::new(pty_master));
+                    }
+                    Err(err) => {
+                        error!("Receive PTY master error: {}", err);
+                    }
                 }
+            });
 
-                Box::new(
-                    runc.run(
-                        &id,
-                        &bundle,
-                        Some(&CreateOpts {
-                            pid_file: None,
-                            console_socket: Some(console_socket),
-                            no_pivot: false,
-                            no_new_keyring: false,
-                            detach: true,
-                        }),
-                    )
-                    .and_then(move |runc| {
-                        thread::sleep(Duration::from_millis(500));
-                        runc.state(&id)
-                    }),
-                )
-            },
-        );
+            let bundle = env::temp_dir().join(&id);
+            extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
+                .context(BundleExtractError {})?;
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, container) = runtime.block_on_all(task).expect("test failed");
+            runc.run(
+                &id,
+                &bundle,
+                Some(&CreateOpts {
+                    pid_file: None,
+                    console_socket: Some(console_socket),
+                    no_pivot: false,
+                    no_new_keyring: false,
+                    detach: true,
+                }),
+            )
+            .await?;
+
+            delay_for(Duration::from_millis(500)).await;
+
+            runc.state(&id).await
+        };
+
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let container = runtime.block_on(task).expect("test failed");
 
         assert_eq!(container.status, Some(String::from("running")));
     }
@@ -1724,76 +1516,62 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(
-            move || -> Box<dyn Future<Item = (Runc, Container), Error = Error> + Send> {
-                let mut config: RuncConfiguration = Default::default();
-                config.command = Some(runc_path.clone());
-                config.root = Some(runc_root.clone());
-                config.should_cleanup = true;
-                let runc = match Runc::new(config) {
-                    Ok(runc) => runc,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path);
+        config.root = Some(runc_root);
+        let runc = Runc::new(config).expect("Unable to create runc instance");
 
-                let id = format!("{}", Uuid::new_v4());
-                let console_socket = env::temp_dir().join(&id).with_extension("console");
-                let receive_pty_master = match ReceivePtyMaster::new(&console_socket) {
-                    Ok(receive_pty_master) => receive_pty_master,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let task = async move {
+            let id = format!("{}", Uuid::new_v4());
 
-                // As an ugly hack leak the pty master handle for the lifecycle of the test
-                // we can't close it and we also don't want to block on it (can interfere with deletes)
-                tokio::spawn(
-                    receive_pty_master
-                        .and_then(|pty_master| {
-                            Box::leak(Box::new(pty_master));
-                            Ok(())
-                        })
-                        .map_err(|_| ()),
-                );
-
-                let bundle = env::temp_dir().join(&id);
-                if let Err(e) =
-                    extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
-                {
-                    return Box::new(err(e.into()));
+            // As an ugly hack leak the pty master handle for the lifecycle of the test process
+            // we can't close it and we also don't want to block on it (can interfere with deletes)
+            let console_socket = env::temp_dir().join(&id).with_extension("console");
+            let receive_pty_master = ReceivePtyMaster::new(&console_socket)?;
+            tokio::spawn(async move {
+                match receive_pty_master.receive().await {
+                    Ok(pty_master) => {
+                        Box::leak(Box::new(pty_master));
+                    }
+                    Err(err) => {
+                        error!("Receive PTY master error: {}", err);
+                    }
                 }
+            });
 
-                let state_id = id.clone();
-                let kill_id = id.clone();
-                Box::new(
-                    runc.create(
-                        &id,
-                        &bundle,
-                        Some(&CreateOpts {
-                            pid_file: None,
-                            console_socket: Some(console_socket),
-                            no_pivot: false,
-                            no_new_keyring: false,
-                            detach: false,
-                        }),
-                    )
-                    .and_then(move |runc| runc.start(&id))
-                    .and_then(move |runc| {
-                        thread::sleep(Duration::from_millis(500));
-                        runc.state(&state_id)
-                    })
-                    .and_then(move |(runc, state)| {
-                        runc.kill(&kill_id, libc::SIGKILL, None)
-                            .and_then(move |runc| Ok((runc, state)))
-                    }),
-                )
-            },
-        );
+            let bundle = env::temp_dir().join(&id);
+            extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
+                .context(BundleExtractError {})?;
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, container) = runtime.block_on_all(task).expect("test failed");
+            runc.create(
+                &id,
+                &bundle,
+                Some(&CreateOpts {
+                    pid_file: None,
+                    console_socket: Some(console_socket),
+                    no_pivot: false,
+                    no_new_keyring: false,
+                    detach: false,
+                }),
+            )
+            .await?;
+
+            runc.start(&id).await?;
+
+            delay_for(Duration::from_millis(500)).await;
+
+            let container_state = runc.state(&id).await?;
+            runc.kill(&id, libc::SIGKILL, None).await?;
+            Ok::<_, Error>(container_state)
+        };
+
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let container = runtime.block_on(task).expect("test failed");
 
         assert_eq!(container.status, Some(String::from("running")));
     }
@@ -1808,28 +1586,28 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(|| {
-            ManagedContainer::new(&runc_path, &runc_root, &PathBuf::from("test_fixture/busybox.tar.gz"))
-                .and_then(move |container| -> Box<dyn Future<Item = (Runc, Container), Error = Error> + Send> {
-                    let mut config: RuncConfiguration = Default::default();
-                    config.command = Some(runc_path.clone());
-                    config.root = Some(runc_root.clone());
-                    config.should_cleanup = true;
-                    let runc = match Runc::new(config) {
-                        Ok(runc) => runc,
-                        Err(e) => return Box::new(err(e)),
-                    };
-                    Box::new(runc.state(&container.id))
-                })
-        });
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path.clone());
+        config.root = Some(runc_root.clone());
+        let runc = Runc::new(config).expect("Unable to create runc instance");
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, state) = runtime.block_on_all(task).expect("test failed");
+        let task = async move {
+            let container = ManagedContainer::new(
+                &runc_path,
+                &runc_root,
+                &PathBuf::from("test_fixture/busybox.tar.gz"),
+            )
+            .await?;
+            runc.state(&container.id).await
+        };
+
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let state = runtime.block_on(task).expect("test failed");
 
         assert_eq!(state.status, Some(String::from("running")));
     }
@@ -1844,49 +1622,46 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(|| {
-            ManagedContainer::new(
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path.clone());
+        config.root = Some(runc_root.clone());
+        let runc = Runc::new(config).expect("Unable to create runc instance");
+
+        let task = async move {
+            let container = ManagedContainer::new(
                 &runc_path,
                 &runc_root,
                 &PathBuf::from("test_fixture/busybox.tar.gz"),
             )
-            .and_then(
-                move |container| -> Box<dyn Future<Item = Runc, Error = Error> + Send> {
-                    let mut config: RuncConfiguration = Default::default();
-                    config.command = Some(runc_path.clone());
-                    config.root = Some(runc_root.clone());
-                    config.should_cleanup = true;
-                    let runc = match Runc::new(config) {
-                        Ok(runc) => runc,
-                        Err(e) => return Box::new(err(e)),
-                    };
+            .await
+            .unwrap();
 
-                    Box::new(runc.stats(&container.id).and_then(|(runc, stats)| {
-                        if let Some(memory) = stats.memory.clone() {
-                            if let Some(usage) = memory.usage {
-                                if let Some(usage) = usage.usage {
-                                    if usage > 0 {
-                                        return Ok(runc);
-                                    }
-                                }
-                            }
+            let stats = runc
+                .stats(&container.id)
+                .await
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{}", err)))?;
+            if let Some(memory) = stats.memory {
+                if let Some(usage) = memory.usage {
+                    if let Some(usage) = usage.usage {
+                        if usage > 0 {
+                            return Ok::<_, io::Error>(());
                         }
-                        Err(Error::IoError(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "missing memory usage statistics",
-                        )))
-                    }))
-                },
-            )
-        });
+                    }
+                }
+            }
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing memory usage statistics",
+            ))
+        };
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        runtime.block_on_all(task).expect("test failed");
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        runtime.block_on(task).expect("test failed");
     }
 
     #[test]
@@ -1899,54 +1674,49 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(|| {
-            ManagedContainer::new(
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path.clone());
+        config.root = Some(runc_root.clone());
+        let runc = Runc::new(config).expect("Unable to create runc instance");
+
+        let task = async move {
+            let container = ManagedContainer::new(
                 &runc_path,
                 &runc_root,
                 &PathBuf::from("test_fixture/busybox.tar.gz"),
             )
-            .and_then(
-                move |container| -> Box<dyn Future<Item = Runc, Error = Error> + Send> {
-                    let mut config: RuncConfiguration = Default::default();
-                    config.command = Some(runc_path.clone());
-                    config.root = Some(runc_root.clone());
-                    config.should_cleanup = true;
-                    let runc = match Runc::new(config) {
-                        Ok(runc) => runc,
-                        Err(e) => return Box::new(err(e)),
-                    };
+            .await
+            .unwrap();
 
-                    // Time for shell to spawn
-                    thread::sleep(Duration::from_millis(100));
+            // Time for shell to spawn
+            delay_for(Duration::from_millis(100)).await;
 
-                    Box::new(runc.top(&container.id, None).and_then(|(runc, processes)| {
-                        if processes.len() != 1 {
-                            return Err(Error::IoError(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "expected a single shell process",
-                            )));
-                        }
-                        if let Some(process) = processes.get(0) {
-                            if process["CMD"] != "[sh]" {
-                                return Err(Error::IoError(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "expected shell",
-                                )));
-                            }
-                        }
-                        Ok(runc)
-                    }))
-                },
-            )
-        });
+            let processes = runc
+                .top(&container.id, None)
+                .await
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{}", err)))?;
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        runtime.block_on_all(task).expect("test failed");
+            if processes.len() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected a single shell process",
+                ));
+            }
+            if let Some(process) = processes.get(0) {
+                if process["CMD"] != "sh" {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "expected shell"));
+                }
+            }
+            Ok::<_, io::Error>(())
+        };
+
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        runtime.block_on(task).expect("test failed");
     }
 
     #[test]
@@ -1959,90 +1729,80 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(
-            move || -> Box<dyn Future<Item = (Runc, Stats), Error = Error> + Send> {
-                let mut config: RuncConfiguration = Default::default();
-                config.command = Some(runc_path.clone());
-                config.root = Some(runc_root.clone());
-                config.should_cleanup = true;
-                let runc = match Runc::new(config) {
-                    Ok(runc) => runc,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path);
+        config.root = Some(runc_root);
+        let runc = Runc::new(config).expect("Unable to create runc instance");
 
-                let id = format!("{}", Uuid::new_v4());
-                let console_socket = env::temp_dir().join(&id).with_extension("console");
-                let receive_pty_master = match ReceivePtyMaster::new(&console_socket) {
-                    Ok(receive_pty_master) => receive_pty_master,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let task = async move {
+            let id = format!("{}", Uuid::new_v4());
 
-                // As an ugly hack leak the pty master handle for the lifecycle of the test
-                // we can't close it and we also don't want to block on it (can interfere with deletes)
-                tokio::spawn(
-                    receive_pty_master
-                        .and_then(|pty_master| {
-                            Box::leak(Box::new(pty_master));
-                            Ok(())
-                        })
-                        .map_err(|_| ()),
-                );
-
-                let bundle = env::temp_dir().join(&id);
-                if let Err(e) =
-                    extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
-                {
-                    return Box::new(err(e.into()));
+            // As an ugly hack leak the pty master handle for the lifecycle of the test
+            // we can't close it and we also don't want to block on it (can interfere with deletes)
+            let console_socket = env::temp_dir().join(&id).with_extension("console");
+            let receive_pty_master = ReceivePtyMaster::new(&console_socket)
+                .expect("Unable to open pty receiving socket");
+            tokio::spawn(async move {
+                match receive_pty_master.receive().await {
+                    Ok(pty_master) => {
+                        Box::leak(Box::new(pty_master));
+                    }
+                    Err(err) => {
+                        error!("Receive PTY master error: {}", err);
+                    }
                 }
+            });
 
-                let stats_id = id.clone();
-                Box::new(
-                    runc.run(
-                        &id,
-                        &bundle,
-                        Some(&CreateOpts {
-                            pid_file: None,
-                            console_socket: Some(console_socket),
-                            no_pivot: false,
-                            no_new_keyring: false,
-                            detach: true,
-                        }),
-                    )
-                    .and_then(move |runc| {
-                        runc.update(
-                            &id,
-                            &LinuxResources {
-                                devices: None,
-                                memory: Some(LinuxMemory {
-                                    limit: Some(232_000_000),
-                                    reservation: None,
-                                    swap: None,
-                                    kernel: None,
-                                    kernel_tcp: None,
-                                    swappiness: None,
-                                    disable_oom_killer: None,
-                                }),
-                                cpu: None,
-                                pids: None,
-                                block_io: None,
-                                hugepage_limits: None,
-                                network: None,
-                                rdma: None,
-                            },
-                        )
-                    })
-                    .and_then(move |runc| runc.stats(&stats_id)),
-                )
-            },
-        );
+            let bundle = env::temp_dir().join(&id);
+            extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
+                .context(BundleExtractError {})?;
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, stats) = runtime.block_on_all(task).expect("test failed");
+            runc.run(
+                &id,
+                &bundle,
+                Some(&CreateOpts {
+                    pid_file: None,
+                    console_socket: Some(console_socket),
+                    no_pivot: false,
+                    no_new_keyring: false,
+                    detach: true,
+                }),
+            )
+            .await?;
+
+            runc.update(
+                &id,
+                &LinuxResources {
+                    devices: None,
+                    memory: Some(LinuxMemory {
+                        limit: Some(232_000_000),
+                        reservation: None,
+                        swap: None,
+                        kernel: None,
+                        kernel_tcp: None,
+                        swappiness: None,
+                        disable_oom_killer: None,
+                    }),
+                    cpu: None,
+                    pids: None,
+                    block_io: None,
+                    hugepage_limits: None,
+                    network: None,
+                    rdma: None,
+                },
+            )
+            .await?;
+
+            runc.stats(&id).await
+        };
+
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let stats = runtime.block_on(task).expect("test failed");
 
         if let Some(memory) = stats.memory {
             if let Some(usage) = memory.usage {
@@ -2062,23 +1822,26 @@ mod tests {
     fn test_version() {
         let runc_id = format!("{}", Uuid::new_v4());
         let runc_path = env::temp_dir().join(&runc_id).join("runc.amd64");
+        let runc_root =
+            PathBuf::from(env::var_os("XDG_RUNTIME_DIR").expect("expected temporary path"))
+                .join("rust-runc")
+                .join(&runc_id);
+        fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
         let mut config: RuncConfiguration = Default::default();
         config.command = Some(runc_path);
-        config.should_cleanup = true;
-        let runc = Runc::new(config).expect("unable to build runc client");
+        config.root = Some(runc_root);
+        let runc = Runc::new(config).expect("Unable to create runc instance");
 
-        let task = runc.version();
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let version = runtime.block_on(runc.version()).expect("test failed");
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, version) = runtime.block_on_all(task).expect("test failed");
-
-        assert_eq!(version.runc_version, Some(String::from("1.0.0-rc9")));
+        assert_eq!(version.runc_version, Some(String::from("1.0.0-rc10")));
         assert_eq!(version.spec_version, Some(String::from("1.0.1-dev")));
     }
 
@@ -2092,85 +1855,69 @@ mod tests {
                 .join(&runc_id);
         fs::create_dir_all(&runc_root).expect("unable to create runc root");
         extract_tarball(
-            &PathBuf::from("test_fixture/runc_v1.0.0-rc9.tar.gz"),
+            &PathBuf::from("test_fixture/runc_v1.0.0-rc10.tar.gz"),
             &env::temp_dir().join(&runc_id),
         )
         .expect("unable to extract runc");
 
-        let task = lazy(
-            move || -> Box<dyn Future<Item = (Runc, tokio::fs::File), Error = Error> + Send> {
-                let mut config: RuncConfiguration = Default::default();
-                config.command = Some(runc_path.clone());
-                config.root = Some(runc_root.clone());
-                config.should_cleanup = true;
-                let runc = match Runc::new(config) {
-                    Ok(runc) => runc,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let mut config: RuncConfiguration = Default::default();
+        config.command = Some(runc_path);
+        config.root = Some(runc_root);
+        let runc = Runc::new(config).expect("Unable to create runc instance");
 
-                let id = format!("{}", Uuid::new_v4());
-                let console_socket = env::temp_dir().join(&id).with_extension("console");
-                let receive_pty_master = match ReceivePtyMaster::new(&console_socket) {
-                    Ok(receive_pty_master) => receive_pty_master,
-                    Err(e) => return Box::new(err(e)),
-                };
+        let task = async move {
+            let id = format!("{}", Uuid::new_v4());
 
-                let bundle = env::temp_dir().join(&id);
-                if let Err(e) =
-                    extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
-                {
-                    return Box::new(err(e.into()));
+            let (fd_sender, fd_receiver) = futures::channel::oneshot::channel::<tokio::fs::File>();
+            let console_socket = env::temp_dir().join(&id).with_extension("console");
+            let receive_pty_master = ReceivePtyMaster::new(&console_socket)?;
+            tokio::spawn(async move {
+                match receive_pty_master.receive().await {
+                    Ok(pty_master) => {
+                        fd_sender.send(pty_master).unwrap();
+                    }
+                    Err(err) => {
+                        error!("Receive PTY master error: {}", err);
+                    }
                 }
+            });
 
-                Box::new(
-                    Delay::new(Instant::now().add(Duration::from_millis(100)))
-                        .map_err(|_| Error::Unknown)
-                        .and_then(move |_| {
-                            runc.run(
-                                &id,
-                                &bundle,
-                                Some(&CreateOpts {
-                                    pid_file: None,
-                                    console_socket: Some(console_socket),
-                                    no_pivot: false,
-                                    no_new_keyring: false,
-                                    detach: true,
-                                }),
-                            )
-                            .join(receive_pty_master)
-                        }),
-                )
-            },
-        );
+            let bundle = env::temp_dir().join(&id);
+            extract_tarball(&PathBuf::from("test_fixture/busybox.tar.gz"), &bundle)
+                .context(BundleExtractError {})?;
 
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (runc, mut pty_master): (Runc, tokio::fs::File) =
-            runtime.block_on_all(task).expect("test failed");
+            runc.run(
+                &id,
+                &bundle,
+                Some(&CreateOpts {
+                    pid_file: None,
+                    console_socket: Some(console_socket),
+                    no_pivot: false,
+                    no_new_keyring: false,
+                    detach: true,
+                }),
+            )
+            .await?;
 
-        let task = lazy(move || -> FutureResult<(Runc, String), Error> {
+            Ok::<_, Error>(fd_receiver.await.unwrap())
+        };
+
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let mut pty_master = runtime.block_on(task).expect("test failed");
+
+        let task = async move {
             let mut response = [0u8; 160];
-            // Clear cursor
-            if let Err(e) = pty_master.read(&mut response) {
-                return err(e.into());
-            }
+            pty_master.read(&mut response).await?;
+            pty_master.write(b"uname -a && exit\n").await?;
 
-            if let Err(e) = pty_master.write("uname -a && exit\n".as_bytes()) {
-                return err(e.into());
-            }
+            delay_for(Duration::from_millis(500)).await;
 
-            thread::sleep(Duration::from_millis(500));
+            let len = pty_master.read(&mut response).await?;
+            Ok::<_, io::Error>(String::from_utf8(Vec::from(&response[..len])).unwrap())
+        };
 
-            match pty_master.read(&mut response) {
-                Ok(len) => match String::from_utf8(Vec::from(&response[..len])) {
-                    Ok(response) => ok((runc, response)),
-                    Err(e) => err(e.into()),
-                },
-                Err(e) => err(e.into()),
-            }
-        });
-
-        let runtime = Runtime::new().expect("unable to create runtime");
-        let (_, response) = runtime.block_on_all(task).expect("test failed");
+        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let response = runtime.block_on(task).expect("test failed");
 
         let response = match response
             .split('\n')
@@ -2199,63 +1946,53 @@ mod tests {
     }
 
     impl ManagedContainer {
-        fn new(
+        async fn new(
             runc_path: &PathBuf,
             runc_root: &PathBuf,
             compressed_bundle: &PathBuf,
-        ) -> Box<dyn Future<Item = Self, Error = Error> + Send> {
+        ) -> Result<Self, Error> {
             let id = format!("{}", Uuid::new_v4());
             let bundle = env::temp_dir().join(&id);
-            if let Err(e) = extract_tarball(compressed_bundle, &bundle) {
-                return Box::new(err(e.into()));
-            }
+            extract_tarball(compressed_bundle, &bundle).expect("Unable to extract bundle");
 
             let mut config: RuncConfiguration = Default::default();
             config.command = Some(runc_path.clone());
             config.root = Some(runc_root.clone());
-            let runc = match Runc::new(config) {
-                Ok(runc) => runc,
-                Err(e) => return Box::new(err(e)),
-            };
-
-            let console_socket = env::temp_dir().join(id.clone()).with_extension("console");
-            let receive_pty_master = match ReceivePtyMaster::new(&console_socket) {
-                Ok(receive_pty_master) => receive_pty_master,
-                Err(e) => return Box::new(err(e)),
-            };
+            let runc = Runc::new(config)?;
 
             // As an ugly hack leak the pty master handle for the lifecycle of the test
             // we can't close it and we also don't want to block on it (can interfere with deletes)
-            tokio::spawn(
-                receive_pty_master
-                    .and_then(|pty_master| {
+            let console_socket = env::temp_dir().join(&id).with_extension("console");
+            let receive_pty_master = ReceivePtyMaster::new(&console_socket)
+                .expect("Unable to open pty receiving socket");
+            tokio::spawn(async move {
+                match receive_pty_master.receive().await {
+                    Ok(pty_master) => {
                         Box::leak(Box::new(pty_master));
-                        Ok(())
-                    })
-                    .map_err(|_| ()),
-            );
+                    }
+                    Err(err) => {
+                        error!("Receive PTY master error: {}", err);
+                    }
+                }
+            });
 
-            let start_id = id.clone();
-            Box::new(
-                runc.create(
-                    &id,
-                    &bundle,
-                    Some(&CreateOpts {
-                        pid_file: None,
-                        console_socket: Some(console_socket),
-                        no_pivot: false,
-                        no_new_keyring: false,
-                        detach: false,
-                    }),
-                )
-                .and_then(move |runc| runc.start(&start_id))
-                .and_then(move |runc| {
-                    Ok(Self {
-                        id,
-                        runc: Some(runc),
-                    })
+            runc.create(
+                &id,
+                &bundle,
+                Some(&CreateOpts {
+                    pid_file: None,
+                    console_socket: Some(console_socket),
+                    no_pivot: false,
+                    no_new_keyring: false,
+                    detach: false,
                 }),
             )
+            .await?;
+            runc.start(&id).await?;
+            Ok(Self {
+                id,
+                runc: Some(runc),
+            })
         }
     }
 
@@ -2263,14 +2000,12 @@ mod tests {
         fn drop(&mut self) {
             if let Some(runc) = self.runc.take() {
                 let bundle = env::temp_dir().join(&self.id);
-                tokio::spawn(
+                block_on(async move {
                     runc.delete(&self.id, Some(&DeleteOpts { force: true }))
-                        .and_then(move |_| {
-                            fs::remove_dir_all(&bundle)?;
-                            Ok(())
-                        })
-                        .map_err(|_| ()),
-                );
+                        .await
+                        .expect("Unable to delete container");
+                    fs::remove_dir_all(&bundle).expect("Unable to delete bundle");
+                });
             }
         }
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 fsyncd, Berlin, Germany.
+ * Copyright 2020 fsyncd, Berlin, Germany.
  * Additional material, copyright of the containerd authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");

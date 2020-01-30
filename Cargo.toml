@@ -1,6 +1,6 @@
 [package]
 name = "rust-runc"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["fsyncd"]
 description = "A crate for consuming the runc binary in your Rust applications."
 repository = "https://github.com/fsyncd/rust-runc"
@@ -9,17 +9,18 @@ edition = "2018"
 exclude = ["test_fixture"]
 
 [dependencies]
-chrono = { version = "0.4", features = ["serde"] }
-futures = "0.1.29"
+chrono = { version = "0.4.10", features = ["serde"] }
+futures = "0.3.1"
+libc = "0.2.66"
 log = "0.4.8"
-libc = "0.2.65"
-mio = "0.6.19"
-serde = { version = "1.0.102", features = ["derive"] }
-serde_json = "1.0.41"
-tokio = "0.1.22"
-tokio-process = "0.2.4"
+mio = "0.6.21"
+mio-uds = "0.6.7"
+serde = "1.0.104"
+serde_json = "1.0.45"
+snafu = "0.6.2"
+tokio = { version = "0.2.11", features = ["full"] }
 uuid = { version = "0.8.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
-flate2 = "1.0.12"
+flate2 = "1.0.13"
 tar = "0.4.26"

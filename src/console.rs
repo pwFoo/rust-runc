@@ -15,119 +15,90 @@
  */
 
 use std::ffi::c_void;
-use std::io::ErrorKind;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
-use std::{fs, io, ptr};
+use std::{fs, ptr};
+use tokio::future::poll_fn;
 
-use futures::{try_ready, Async, Future, Stream};
 use log::warn;
 use mio::Ready;
+use mio_uds::{UnixListener, UnixStream};
 use tokio::fs::File;
-use tokio::net::{UnixListener, UnixStream};
 
-use crate::Error;
+use crate::*;
+use tokio::io::PollEvented;
 
 /// Receive a PTY master over the provided unix socket
 pub struct ReceivePtyMaster {
     console_socket: PathBuf,
-    console_stream: Option<UnixStream>,
-    console_stream_future: Box<dyn Future<Item = UnixStream, Error = Error> + Send>,
+    listener: Option<UnixListener>,
 }
 
+// Looks to be a false positive
+#[allow(clippy::cast_ptr_alignment)]
 impl ReceivePtyMaster {
-    /// A future for a unix socket that will return a PTY master file descriptor
+    /// Bind a unix domain socket to the provided path
     pub fn new(console_socket: &PathBuf) -> Result<Self, Error> {
-        let console_stream_future = Box::new(
-            UnixListener::bind(console_socket)?
-                .incoming()
-                .take(1)
-                .into_future()
-                .then(|res| match res {
-                    Ok((None, _)) => Err(Error::IoError(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "closed without receiving pty",
-                    ))),
-                    Ok((Some(stream), _)) => Ok(stream),
-                    Err((e, _)) => Err(e.into()),
-                }),
-        );
-        Ok(ReceivePtyMaster {
+        let listener = UnixListener::bind(console_socket).context(UnixSocketOpenError {})?;
+        Ok(Self {
             console_socket: console_socket.clone(),
-            console_stream: None,
-            console_stream_future,
+            listener: Some(listener),
         })
     }
-}
 
-impl Future for ReceivePtyMaster {
-    type Item = File;
-    type Error = Error;
+    /// Receive a master PTY file descriptor from the socket
+    pub async fn receive(mut self) -> Result<File, Error> {
+        let io = PollEvented::new(self.listener.take().unwrap()).unwrap();
+        poll_fn(|cx| io.poll_read_ready(cx, Ready::readable()))
+            .await
+            .unwrap();
 
-    // Looks to be a false positive
-    #[allow(clippy::cast_ptr_alignment)]
-    fn poll(&mut self) -> Result<Async<Self::Item>, Self::Error> {
-        if self.console_stream.is_none() {
-            self.console_stream
-                .replace(try_ready!(self.console_stream_future.poll()));
-        }
+        let (console_stream, _) = io
+            .get_ref()
+            .accept_std()
+            .context(UnixSocketConnectError {})?
+            .unwrap();
+        let console_stream =
+            PollEvented::new(UnixStream::from_stream(console_stream).unwrap()).unwrap();
 
         loop {
-            // 4096 is the max name length from the go-runc implementation
-            let mut iov_base = [0u8; 4096];
-            let mut message_buf = [0u8; 24];
-            let mut io = libc::iovec {
-                iov_len: iov_base.len(),
-                iov_base: &mut iov_base as *mut _ as *mut c_void,
-            };
-            let mut msg = libc::msghdr {
-                msg_name: ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: &mut io,
-                msg_iovlen: 1,
-                msg_control: &mut message_buf as *mut _ as *mut c_void,
-                msg_controllen: message_buf.len(),
-                msg_flags: 0,
-            };
+            poll_fn(|cx| console_stream.poll_read_ready(cx, Ready::readable()))
+                .await
+                .unwrap();
 
-            match self.console_stream.take() {
-                Some(console_stream) => {
-                    match console_stream.poll_read_ready(Ready::readable()) {
-                        Ok(Async::Ready(_)) => (),
-                        Ok(Async::NotReady) => {
-                            self.console_stream.replace(console_stream);
-                            return Ok(Async::NotReady);
-                        }
-                        Err(e) => return Err(e.into()),
-                    };
+            {
+                // 4096 is the max name length from the go-runc implementation
+                let mut iov_base = [0u8; 4096];
+                let mut message_buf = [0u8; 24];
+                let mut io = libc::iovec {
+                    iov_len: iov_base.len(),
+                    iov_base: &mut iov_base as *mut _ as *mut c_void,
+                };
+                let mut msg = libc::msghdr {
+                    msg_name: ptr::null_mut(),
+                    msg_namelen: 0,
+                    msg_iov: &mut io,
+                    msg_iovlen: 1,
+                    msg_control: &mut message_buf as *mut _ as *mut c_void,
+                    msg_controllen: message_buf.len(),
+                    msg_flags: 0,
+                };
 
-                    let ret = unsafe { libc::recvmsg(console_stream.as_raw_fd(), &mut msg, 0) };
-                    return if ret < 0 {
-                        Err(Error::IoError(io::Error::new(
-                            ErrorKind::BrokenPipe,
-                            "pty not received",
-                        )))
-                    } else {
-                        Ok(Async::Ready(unsafe {
-                            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-                            if cmsg.is_null() {
-                                continue;
-                            }
-                            let cmsg_data = libc::CMSG_DATA(cmsg);
-                            if cmsg_data.is_null() {
-                                return Err(Error::IoError(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "expected message data",
-                                )));
-                            }
-                            File::from_std(std::fs::File::from_raw_fd(ptr::read_unaligned(
-                                cmsg_data as *const i32,
-                            )))
-                        }))
-                    };
+                let console_stream_fd = console_stream.get_ref().as_raw_fd();
+                let ret = unsafe { libc::recvmsg(console_stream_fd, &mut msg, 0) };
+                ensure!(ret >= 0, UnixSocketReceiveMessageError {});
+                unsafe {
+                    let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                    if cmsg.is_null() {
+                        continue;
+                    }
+                    let cmsg_data = libc::CMSG_DATA(cmsg);
+                    ensure!(!cmsg_data.is_null(), UnixSocketReceiveMessageError {});
+                    return Ok(File::from_std(std::fs::File::from_raw_fd(
+                        ptr::read_unaligned(cmsg_data as *const i32),
+                    )));
                 }
-                None => return Err(Error::Unknown),
             }
         }
     }
