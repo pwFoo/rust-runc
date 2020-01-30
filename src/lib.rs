@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+//! A crate for consuming the runc binary in your Rust applications.
+
 use crate::events::{Event, Stats};
 use crate::specs::{LinuxResources, Process};
 use chrono::{DateTime, Utc};
@@ -29,7 +31,6 @@ use std::io::Write;
 use std::iter::FromIterator;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::string::FromUtf8Error;
 use std::time::Duration;
 use std::{env, fs, io};
 use tokio::io::AsyncBufReadExt;
@@ -55,11 +56,17 @@ pub type TopResults = Vec<HashMap<String, String>>;
 /// Runc client error
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to locate the runc binary"))]
-    RuncNotFoundError {},
+    #[snafu(display("Unable to extract test files: {}", source))]
+    BundleExtractError { source: io::Error },
 
     #[snafu(display("Invalid path: {}", source))]
     InvalidPathError { source: io::Error },
+
+    #[snafu(display("Json deserialization error: {}", source))]
+    JsonDeserializationError { source: serde_json::error::Error },
+
+    #[snafu(display("Missing container statistics"))]
+    MissingContainerStatsError {},
 
     #[snafu(display("Unable to spawn process: {}", source))]
     ProcessSpawnError { source: io::Error },
@@ -67,33 +74,17 @@ pub enum Error {
     #[snafu(display("Runc command error: {}", source))]
     RuncCommandError { source: io::Error },
 
+    #[snafu(display("Runc command failed, stdout: \"{}\", stderr: \"{}\"", stdout, stderr))]
+    RuncCommandFailedError { stdout: String, stderr: String },
+
     #[snafu(display("Runc command timed out: {}", source))]
     RuncCommandTimeoutError { source: tokio::time::Elapsed },
 
-    #[snafu(display("Unicode conversion error: {}", source))]
-    UnicodeConversionError { source: FromUtf8Error },
+    #[snafu(display("Unable to parse runc version"))]
+    RuncInvalidVersionError {},
 
-    #[snafu(display(
-        "Runc returned with an error, stdout: \"{}\", stderr: \"{}\"",
-        stdout,
-        stderr
-    ))]
-    RuncCommandFailedError { stdout: String, stderr: String },
-
-    #[snafu(display("JSON deserialization error: {}", source))]
-    JsonDeserializationError { source: serde_json::error::Error },
-
-    #[snafu(display("Missing container statistics"))]
-    MissingContainerStatsError {},
-
-    #[snafu(display("Top command is missing a pid header"))]
-    TopMissingPidHeaderError {},
-
-    #[snafu(display("Top command returned an empty response"))]
-    TopShortResponseError {},
-
-    #[snafu(display("Failed to find valid path for spec file"))]
-    SpecFilePathError {},
+    #[snafu(display("Unable to locate the runc binary"))]
+    RuncNotFoundError {},
 
     #[snafu(display("Failed to create spec file: {}", source))]
     SpecFileCreationError { source: io::Error },
@@ -101,26 +92,26 @@ pub enum Error {
     #[snafu(display("Failed to cleanup spec file: {}", source))]
     SpecFileCleanupError { source: io::Error },
 
-    #[snafu(display("Unable to parse runc version"))]
-    RuncInvalidVersionError {},
+    #[snafu(display("Failed to find valid path for spec file"))]
+    SpecFilePathError {},
 
-    #[snafu(display("Unable to parse runc spec version"))]
-    RuncInvalidSpecVersionError {},
+    #[snafu(display("Top command is missing a pid header"))]
+    TopMissingPidHeaderError {},
 
-    #[snafu(display("Unable to bind to unix socket: {}", source))]
-    UnixSocketOpenError { source: io::Error },
-
-    #[snafu(display("Unix socket unexpectedly closed"))]
-    UnixSocketUnexpectedCloseError {},
+    #[snafu(display("Top command returned an empty response"))]
+    TopShortResponseError {},
 
     #[snafu(display("Unix socket connection error: {}", source))]
     UnixSocketConnectError { source: io::Error },
 
-    #[snafu(display("Unix socket connection error"))]
+    #[snafu(display("Unable to bind to unix socket: {}", source))]
+    UnixSocketOpenError { source: io::Error },
+
+    #[snafu(display("Unix socket failed to receive pty"))]
     UnixSocketReceiveMessageError {},
 
-    #[snafu(display("Unable to extract test files: {}", source))]
-    BundleExtractError { source: io::Error },
+    #[snafu(display("Unix socket unexpectedly closed"))]
+    UnixSocketUnexpectedCloseError {},
 }
 
 /// Runc container
@@ -504,7 +495,7 @@ impl Runc {
                     line.split(": ")
                         .nth(1)
                         .map(String::from)
-                        .context(RuncInvalidSpecVersionError {})?,
+                        .context(RuncInvalidVersionError {})?,
                 );
             } else if line.contains("commit") {
                 version.commit = line.split(": ").nth(1).map(String::from);
@@ -528,8 +519,8 @@ impl Runc {
             .context(RuncCommandTimeoutError {})?
             .context(RuncCommandError {})?;
 
-        let stdout = String::from_utf8(result.stdout.clone()).context(UnicodeConversionError {})?;
-        let stderr = String::from_utf8(result.stderr.clone()).context(UnicodeConversionError {})?;
+        let stdout = String::from_utf8(result.stdout.clone()).unwrap();
+        let stderr = String::from_utf8(result.stderr.clone()).unwrap();
         ensure!(
             result.status.success(),
             RuncCommandFailedError {
