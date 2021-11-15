@@ -124,7 +124,7 @@ pub struct Process {
     /// Out of memory score for the container
     #[serde(rename = "oomScoreAdj")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub oom_score_adj: Option<usize>,
+    pub oom_score_adj: Option<isize>,
     /// Selinux context that the container is run as
     #[serde(rename = "selinuxLabel")]
     #[serde(skip_serializing_if = "Option::is_none")]
